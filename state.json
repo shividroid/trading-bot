@@ -1,0 +1,14 @@
+{
+  "position": "flat",
+  "entry_price": 0.0,
+  "contracts": 0,
+  "consecutive_losses": 0,
+  "recovery_count": 0,
+  "recovery_active": false,
+  "current_multiplier": 1.0,
+  "last_signal": "",
+  "last_signal_bar": "",
+  "total_trades": 0,
+  "wins": 0,
+  "losses": 0
+}
