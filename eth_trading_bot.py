@@ -233,36 +233,63 @@ def send_delta_webhook(message):
 # CANDLE DATA — Binance public API (no key needed)
 # ═══════════════════════════════════════════════════════════════════════════
 
+def _parse_binance_klines(data, limit):
+    """Parse standard Binance klines format"""
+    df = pd.DataFrame(data, columns=[
+        "open_time","open","high","low","close","volume",
+        "close_time","qav","num_trades","tbbav","tbqav","ignore"
+    ])
+    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
+    df = df.set_index("open_time")
+    for col in ["open","high","low","close","volume"]:
+        df[col] = df[col].astype(float)
+    return df.iloc[:-1]  # drop incomplete current candle
+
 def fetch_candles(limit=600):
     """
-    Fetch ETH/USDT 1hr candles from Binance.
+    Fetch ETH/USDT 1hr candles — tries multiple sources.
     Returns DataFrame with columns: open, high, low, close, volume
-    Index: datetime UTC
     """
-    url = "https://api.binance.com/api/v3/klines"
-    params = {
-        "symbol":   "ETHUSDT",
-        "interval": "1h",
-        "limit":    limit,
-    }
+    sources = [
+        ("binance.us",  "https://api.binance.us/api/v3/klines",  {"symbol":"ETHUSDT","interval":"1h","limit":limit}),
+        ("binance.com", "https://api.binance.com/api/v3/klines", {"symbol":"ETHUSDT","interval":"1h","limit":limit}),
+        ("binance.com-futures", "https://fapi.binance.com/fapi/v1/klines", {"symbol":"ETHUSDT","interval":"1h","limit":limit}),
+    ]
+
+    for name, url, params in sources:
+        try:
+            r = requests.get(url, params=params, timeout=15)
+            r.raise_for_status()
+            data = r.json()
+            if not isinstance(data, list) or len(data) < 10:
+                raise ValueError(f"Too few candles: {len(data)}")
+            df = _parse_binance_klines(data, limit)
+            if len(df) > 50:
+                print(f"[DATA] Fetched {len(df)} confirmed 1hr candles from {name}")
+                return df
+        except Exception as e:
+            print(f"[DATA] {name} failed: {e}")
+
+    # KuCoin fallback
     try:
-        r = requests.get(url, params=params, timeout=15)
-        data = r.json()
-        df = pd.DataFrame(data, columns=[
-            "open_time","open","high","low","close","volume",
-            "close_time","qav","num_trades","tbbav","tbqav","ignore"
-        ])
-        df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
-        df = df.set_index("open_time")
-        for col in ["open","high","low","close","volume"]:
-            df[col] = df[col].astype(float)
-        # Drop the current (incomplete) candle — last row
-        df = df.iloc[:-1]
-        print(f"[DATA] Fetched {len(df)} confirmed 1hr candles")
-        return df
+        url = "https://api.kucoin.com/api/v1/market/candles"
+        r = requests.get(url, params={"symbol":"ETH-USDT","type":"1hour"}, timeout=15)
+        resp = r.json()
+        if resp.get("code") == "200000" and resp.get("data"):
+            raw = list(reversed(resp["data"]))[-limit:]
+            rows = [{"open_time": pd.to_datetime(int(c[0]), unit="s", utc=True),
+                     "open": float(c[1]), "close": float(c[2]),
+                     "high": float(c[3]), "low":   float(c[4]),
+                     "volume": float(c[5])} for c in raw]
+            df = pd.DataFrame(rows).set_index("open_time").iloc[:-1]
+            if len(df) > 50:
+                print(f"[DATA] Fetched {len(df)} confirmed 1hr candles from kucoin")
+                return df
     except Exception as e:
-        print(f"[DATA ERROR] {e}")
-        return None
+        print(f"[DATA] kucoin failed: {e}")
+
+    print("[DATA ERROR] All sources failed — no candle data available")
+    return None
 
 # ═══════════════════════════════════════════════════════════════════════════
 # HEIKIN ASHI CONVERSION
@@ -876,6 +903,11 @@ def main():
     # Persist regime state so it survives between hourly runs
     state["sideways_mode"]  = debug.get("sideways_mode", False)
     state["cum_whips_mode"] = debug.get("cum_whips_mode", 0)
+
+    # Safety: if all data sources failed, alert and exit cleanly
+    if df is None or len(df) == 0:
+        send_telegram("⚠️ ETH Bot: No candle data from any source. Skipping this run.")
+        return
 
     # Dedup — don't fire same signal on same bar twice
     # (in case script runs more than once per hour accidentally)
