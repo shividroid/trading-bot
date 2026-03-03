@@ -3,16 +3,15 @@ name: ETH Trading Bot
 on:
   schedule:
     # Runs at the start of every hour (UTC)
-    # GitHub Actions cron uses UTC — matches our pause window logic
     - cron: '0 * * * *'
 
-  # Also allows manual trigger from GitHub Actions tab (useful for testing)
+  # Manual trigger from Actions tab — use this to test first
   workflow_dispatch:
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 10       # kill if hangs (safety net)
+    timeout-minutes: 10
 
     steps:
       - name: Checkout repo
@@ -30,14 +29,10 @@ jobs:
         env:
           TELEGRAM_TOKEN:    ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID:  ${{ secrets.TELEGRAM_CHAT_ID }}
-          DELTA_API_KEY:     ${{ secrets.DELTA_API_KEY }}
-          DELTA_API_SECRET:  ${{ secrets.DELTA_API_SECRET }}
           DELTA_WEBHOOK_URL: ${{ secrets.DELTA_WEBHOOK_URL }}
         run: python eth_trading_bot.py
 
-      # State file (position/recovery) needs to persist between hourly runs.
-      # GitHub Actions workspace is wiped after each run, so we commit
-      # state.json back to the repo after every execution.
+      # Commit state.json back so position/recovery persists between runs
       - name: Save state back to repo
         run: |
           git config user.name  "github-actions[bot]"
