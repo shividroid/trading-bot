@@ -273,6 +273,18 @@ def fetch_candles(limit=600):
     # KuCoin fallback
     try:
         url = "https://api.kucoin.com/api/v1/market/candles"
+        # Try US endpoint first
+        for base_url in ["https://api.binance.us/api/v3/klines", 
+                         "https://api.binance.com/api/v3/klines",
+                         "https://fapi.binance.com/fapi/v1/klines"]:
+            try:
+                r = requests.get(base_url, params=params, timeout=15)
+                data = r.json()
+                if isinstance(data, list) and len(data) > 10:
+                    break
+            except:
+                continue
+              
         r = requests.get(url, params={"symbol":"ETH-USDT","type":"1hour"}, timeout=15)
         resp = r.json()
         if resp.get("code") == "200000" and resp.get("data"):
@@ -908,6 +920,10 @@ def main():
     if df is None or len(df) == 0:
         send_telegram("⚠️ ETH Bot: No candle data from any source. Skipping this run.")
         return
+
+    if df is None or len(df) == 0:
+            send_telegram("⚠️ ETH Bot: No candle data available. Skipping.")
+            return
 
     # Dedup — don't fire same signal on same bar twice
     # (in case script runs more than once per hour accidentally)
