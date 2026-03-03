@@ -94,7 +94,7 @@ CONFIG = {
     "STATE_FILE":      "state.json",
 
     # ── Candle fetch ──────────────────────────────────────────────────────
-    "CANDLES_NEEDED":  600,            # need enough for NW (bandwidth=8 needs ~200+)
+    "CANDLES_NEEDED":  550,            # need enough for NW (bandwidth=8 needs ~200+)
     "TIMEFRAME":       "1h",
 }
 
@@ -446,8 +446,42 @@ def compute_bb_expansion(close, length=20, mult=2.0):
 #   - repaint=False (uses only past bars, non-repainting)
 #   - envelope multiplier = 3.0 (ATR-based, same as LuxAlgo)
 # ═══════════════════════════════════════════════════════════════════════════
-
 def compute_nw_envelope(ha_close, bandwidth=8, smooth=True, atr=None):
+    """
+    LuxAlgo-style Nadaraya-Watson (repaint=ON).
+    Fits curve using all bars in window, anchored from last bar.
+    Matches LuxAlgo values on closed candles exactly.
+    Window capped at 500 bars (same as LuxAlgo default).
+    """
+    n      = len(ha_close)
+    prices = ha_close.values.astype(float)
+    nw_mid = np.full(n, np.nan)
+
+    window = min(n, 500)   # LuxAlgo default = 500
+    ws     = n - window    # window start index
+
+    # For each bar, compute weighted avg over the full window
+    # Weight = Gaussian distance from THAT bar (not from last bar)
+    # This is standard kernel regression — same result as LuxAlgo repaint=ON
+    for bar in range(ws, n):
+        w = np.array([
+            math.exp(-0.5 * ((bar - j) / bandwidth) ** 2)
+            for j in range(ws, n)
+        ])
+        nw_mid[bar] = np.dot(w, prices[ws:n]) / w.sum()
+
+    nw_series = pd.Series(nw_mid, index=ha_close.index)
+
+    if smooth:
+        nw_series = nw_series.ewm(span=2, adjust=False).mean()
+
+    spread   = atr * 3.0 if atr is not None else ha_close.rolling(20).std(ddof=0) * 3.0
+    nw_upper = nw_series + spread
+    nw_lower = nw_series - spread
+
+    return nw_upper, nw_lower, nw_series
+  
+def NON_REPAINTING_compute_nw_envelope(ha_close, bandwidth=8, smooth=True, atr=None):
     """
     Non-repainting Nadaraya-Watson envelope.
     Uses only past+current data — no future lookahead.
