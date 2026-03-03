@@ -2,7 +2,10 @@ name: ETH Trading Bot
 
 on:
   schedule:
+    # Runs at the start of every hour (UTC)
     - cron: '0 * * * *'
+
+  # Manual trigger from Actions tab — use this to test first
   workflow_dispatch:
 
 jobs:
@@ -29,6 +32,7 @@ jobs:
           DELTA_WEBHOOK_URL: ${{ secrets.DELTA_WEBHOOK_URL }}
         run: python eth_trading_bot.py
 
+      # Commit state.json back so position/recovery persists between runs
       - name: Save state back to repo
         run: |
           git config user.name  "github-actions[bot]"
