@@ -160,7 +160,9 @@ with st.sidebar:
     st.caption(f"⏱ Bot runs on: **1h** timeframe\n\nStreamlit free tier: **1 GB RAM** · App sleeps after ~7 days inactivity but wakes on next visit instantly.\n\nGitHub Actions free: **2000 min/month** · At 24 runs/day = 720 min/month — well within limit.")
 
 # ── Load data ─────────────────────────────────────────────────────────────────
-st.caption(f"📊 Timeframe: **{selected_tf}** · ETHUSDT · Binance · Cached 2 min · {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
+# Convert to IST for display (UTC+5:30)
+now_ist = datetime.now(timezone.utc) + pd.Timedelta(hours=5, minutes=30)
+st.caption(f"📊 Timeframe: **{selected_tf}** · ETHUSDT · Binance · Cached 2 min · {now_ist.strftime('%Y-%m-%d %H:%M IST')}")
 
 with st.spinner(f"Fetching {selected_tf} candles..."):
     df = fetch_candles(selected_tf, 550)
@@ -169,22 +171,32 @@ if df is None:
     st.error("❌ Could not fetch candle data"); st.stop()
 
 ha = to_heikin_ashi(df)
+
+# Convert timestamps to IST for display (UTC+5:30)
+ist_offset = pd.Timedelta(hours=5, minutes=30)
+df_display = df.copy()
+df_display.index = df_display.index + ist_offset
+ha_display = ha.copy()
+ha_display.index = ha_display.index + ist_offset
 hi, lo, cl = df["high"], df["low"], df["close"]
 tr  = pd.concat([hi-lo,(hi-cl.shift(1)).abs(),(lo-cl.shift(1)).abs()],axis=1).max(axis=1)
 atr = tr.ewm(span=st_period, adjust=False).mean()
 
 st_line, st_dir = compute_supertrend(df, st_period, st_mult)
+st_line.index = df.index + ist_offset
+st_dir.index  = df.index + ist_offset
 bb_exp = compute_bb_expansion(cl)
+bb_exp.index  = df.index + ist_offset
 
 nw_upper_s, nw_lower_s, nw_mid_s = compute_nw(
     tuple(df["close"].tolist()), bw=nw_bw, mult=nw_mult)
 
-nw_upper = pd.Series(nw_upper_s.values, index=df.index)
-nw_lower = pd.Series(nw_lower_s.values, index=df.index)
-nw_mid   = pd.Series(nw_mid_s.values,   index=df.index)
+nw_upper = pd.Series(nw_upper_s.values, index=df.index + ist_offset)
+nw_lower = pd.Series(nw_lower_s.values, index=df.index + ist_offset)
+nw_mid   = pd.Series(nw_mid_s.values,   index=df.index + ist_offset)
 
-# Triangles
-close_s  = df["close"]
+# Triangles — use IST-indexed close
+close_s  = pd.Series(df["close"].values, index=df.index + ist_offset)
 cross_up = (close_s > nw_upper) & (close_s.shift(1) <= nw_upper.shift(1))
 cross_dn = (close_s < nw_lower) & (close_s.shift(1) >= nw_lower.shift(1))
 
@@ -213,7 +225,7 @@ if lux_u > 0 and lux_l > 0:
 
 # ── Chart ─────────────────────────────────────────────────────────────────────
 sl  = bars_to_show
-src = ha.iloc[-sl:] if show_ha else df.iloc[-sl:]
+src = ha_display.iloc[-sl:] if show_ha else df_display.iloc[-sl:]
 fig = go.Figure()
 
 # Candlesticks
@@ -259,21 +271,27 @@ if show_triangles:
             marker=dict(symbol="triangle-up", color="#26a69a", size=14),
             name="▲ Cross Lower (Buy)"))
 
-# SuperTrend — show as line segments coloured by direction
+# SuperTrend — coloured markers as thick line (works reliably)
 if show_st:
     stv = st_line.iloc[-sl:]
     sdv = st_dir.iloc[-sl:]
-    # Bull segments (green)
-    bull_st = stv.copy(); bull_st[sdv != -1] = np.nan
-    bear_st = stv.copy(); bear_st[sdv !=  1] = np.nan
-    fig.add_trace(go.Scatter(
-        x=bull_st.index, y=bull_st.values,
-        line=dict(color="#26a69a", width=2),
-        connectgaps=False, name=f"ST Bull (ATR={st_period}, F={st_mult})"))
-    fig.add_trace(go.Scatter(
-        x=bear_st.index, y=bear_st.values,
-        line=dict(color="#ef5350", width=2),
-        connectgaps=False, name="ST Bear"))
+    bull_mask = sdv == -1
+    bear_mask = sdv ==  1
+    # Use scatter with lines+markers for solid coloured ST line
+    if bull_mask.any():
+        fig.add_trace(go.Scatter(
+            x=stv[bull_mask].index, y=stv[bull_mask].values,
+            mode="lines+markers",
+            line=dict(color="#26a69a", width=2),
+            marker=dict(color="#26a69a", size=3),
+            name=f"ST(ATR={st_period}, F={st_mult}) Bull"))
+    if bear_mask.any():
+        fig.add_trace(go.Scatter(
+            x=stv[bear_mask].index, y=stv[bear_mask].values,
+            mode="lines+markers",
+            line=dict(color="#ef5350", width=2),
+            marker=dict(color="#ef5350", size=3),
+            name="ST Bear"))
 
 fig.update_layout(
     height=580, template="plotly_dark", xaxis_rangeslider_visible=False,
@@ -289,16 +307,21 @@ st.plotly_chart(fig, use_container_width=True)
 # ── Table ─────────────────────────────────────────────────────────────────────
 st.subheader("🔢 Last 15 Bars")
 st.caption(f"LuxAlgo match settings → src=close, Window=500, Bandwidth={nw_bw}, Mult={nw_mult}, Repaint=ON")
-t = df.tail(15).copy()
-t["NW Upper"] = nw_upper.tail(15).round(2)
-t["NW Lower"] = nw_lower.tail(15).round(2)
-t["NW Mid"]   = nw_mid.tail(15).round(2)
-t["ST Line"]  = st_line.tail(15).round(2)
-t["ST"]       = st_dir.tail(15).map({-1:"🟢 BULL", 1:"🔴 BEAR", 0:"-"})
+t = df_display.tail(15).copy()
+t["NW Upper"] = nw_upper.tail(15).values
+t["NW Lower"] = nw_lower.tail(15).values
+t["NW Mid"]   = nw_mid.tail(15).values
+t["ST Line"]  = st_line.tail(15).values
+t["ST"]       = st_dir.tail(15).map({-1:"🟢 BULL", 1:"🔴 BEAR", 0:"-"}).values
+t["NW Upper"] = t["NW Upper"].round(2)
+t["NW Lower"] = t["NW Lower"].round(2)
+t["NW Mid"]   = t["NW Mid"].round(2)
+t["ST Line"]  = t["ST Line"].round(2)
 t["Signal"]   = ""
-t.loc[cross_up.tail(15)[cross_up.tail(15)].index, "Signal"] = "▼ Sell"
-t.loc[cross_dn.tail(15)[cross_dn.tail(15)].index, "Signal"] = "▲ Buy"
-t.index = t.index.strftime("%m-%d %H:%M")
+cup = cross_up.tail(15); cdn = cross_dn.tail(15)
+t.loc[cup[cup].index, "Signal"] = "▼ Sell"
+t.loc[cdn[cdn].index, "Signal"] = "▲ Buy"
+t.index = (t.index + ist_offset).strftime("%m-%d %H:%M IST")
 st.dataframe(
     t[["close","NW Upper","NW Lower","NW Mid","ST Line","ST","Signal"]].rename(columns={"close":"Close"}),
     use_container_width=True)
