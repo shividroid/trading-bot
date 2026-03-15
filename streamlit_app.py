@@ -19,38 +19,96 @@ TF_MAP = {
     "45m":"45m","1h":"1h","2h":"2h","4h":"4h","6h":"6h","1D":"1d","1W":"1w"
 }
 
+# Delta India resolution codes
+DELTA_RES = {
+    "1m":"1m","3m":"3m","5m":"5m","15m":"15m","30m":"30m",
+    "1h":"1h","2h":"2h","4h":"4h","6h":"6h","1D":"1d","1W":"1w"
+}
+
 @st.cache_data(ttl=120)
 def fetch_candles(interval="1h", limit=550):
-    # 45m not supported by Binance — fetch 15m and resample
+    """
+    Fetch ETHUSD candles from Delta India (exact same data as TradingView chart).
+    Falls back to Binance if Delta fails.
+    """
+    import time
+
+    # ── Delta India (primary — exact match with TradingView) ──────────────
+    # 45m not available on Delta either — resample from 15m
+    if interval == "45m":
+        df = _fetch_delta("15m", limit * 3)
+        if df is not None:
+            df = df.resample("45min").agg({
+                "open":"first","high":"max","low":"min","close":"last","volume":"sum"
+            }).dropna().iloc[-limit:]
+            return df
+    else:
+        res = DELTA_RES.get(interval, "1h")
+        df  = _fetch_delta(res, limit)
+        if df is not None:
+            return df
+
+    # ── Binance fallback (if Delta unreachable) ───────────────────────────
+    st.warning("⚠️ Delta India API unavailable — using Binance data (slight price difference)")
+    binance_res = TF_MAP.get(interval, "1h")
     if interval == "45m":
         for url in ["https://api.binance.us/api/v3/klines","https://api.binance.com/api/v3/klines"]:
             try:
                 r=requests.get(url,params={"symbol":"ETHUSDT","interval":"15m","limit":limit*3},timeout=15)
                 data=r.json()
                 if isinstance(data,list) and len(data)>50:
-                    df=pd.DataFrame(data,columns=["open_time","open","high","low","close","volume","close_time","qav","num_trades","tbbav","tbqav","ignore"])
-                    df["open_time"]=pd.to_datetime(df["open_time"],unit="ms",utc=True)
-                    df=df.set_index("open_time")
-                    for c in ["open","high","low","close","volume"]: df[c]=df[c].astype(float)
-                    df=df.iloc[:-1]
-                    df=df.resample("45min").agg({"open":"first","high":"max","low":"min","close":"last","volume":"sum"}).dropna()
-                    return df.iloc[-limit:]
+                    df=_parse_binance(data)
+                    return df.resample("45min").agg({"open":"first","high":"max","low":"min","close":"last","volume":"sum"}).dropna().iloc[-limit:]
             except: pass
-        return None
-
-    binance_interval = TF_MAP.get(interval, "1h")
-    for url in ["https://api.binance.us/api/v3/klines","https://api.binance.com/api/v3/klines"]:
-        try:
-            r=requests.get(url,params={"symbol":"ETHUSDT","interval":binance_interval,"limit":limit},timeout=15)
-            data=r.json()
-            if isinstance(data,list) and len(data)>50:
-                df=pd.DataFrame(data,columns=["open_time","open","high","low","close","volume","close_time","qav","num_trades","tbbav","tbqav","ignore"])
-                df["open_time"]=pd.to_datetime(df["open_time"],unit="ms",utc=True)
-                df=df.set_index("open_time")
-                for c in ["open","high","low","close","volume"]: df[c]=df[c].astype(float)
-                return df.iloc[:-1]
-        except: pass
+    else:
+        for url in ["https://api.binance.us/api/v3/klines","https://api.binance.com/api/v3/klines"]:
+            try:
+                r=requests.get(url,params={"symbol":"ETHUSDT","interval":binance_res,"limit":limit},timeout=15)
+                data=r.json()
+                if isinstance(data,list) and len(data)>50:
+                    return _parse_binance(data)
+            except: pass
     return None
+
+def _fetch_delta(resolution, limit):
+    """Fetch candles from Delta India public API — no auth needed."""
+    import time
+    try:
+        # Delta uses Unix timestamps for start/end
+        # Resolution in seconds for calculating start time
+        res_seconds = {
+            "1m":60,"3m":180,"5m":300,"15m":900,"30m":1800,
+            "1h":3600,"2h":7200,"4h":14400,"6h":21600,"1d":86400,"1w":604800
+        }
+        secs    = res_seconds.get(resolution, 3600)
+        end     = int(time.time())
+        start   = end - secs * (limit + 5)  # fetch a bit extra
+        url     = "https://api.india.delta.exchange/v2/history/candles"
+        params  = {"symbol": "ETHUSD", "resolution": resolution,
+                   "start": start, "end": end}
+        r       = requests.get(url, params=params, timeout=15)
+        resp    = r.json()
+        if resp.get("success") and resp.get("result"):
+            candles = resp["result"]
+            df = pd.DataFrame(candles)
+            # Delta returns: time, open, high, low, close, volume
+            df["open_time"] = pd.to_datetime(df["time"], unit="s", utc=True)
+            df = df.set_index("open_time")
+            for c in ["open","high","low","close","volume"]:
+                df[c] = pd.to_numeric(df[c], errors="coerce")
+            df = df.sort_index()
+            df = df.iloc[:-1]   # drop incomplete current candle
+            return df.iloc[-limit:]
+    except Exception as e:
+        print(f"Delta fetch failed: {e}")
+    return None
+
+def _parse_binance(data):
+    df=pd.DataFrame(data,columns=["open_time","open","high","low","close","volume","close_time","qav","num_trades","tbbav","tbqav","ignore"])
+    df["open_time"]=pd.to_datetime(df["open_time"],unit="ms",utc=True)
+    df=df.set_index("open_time")
+    for c in ["open","high","low","close","volume"]: df[c]=df[c].astype(float)
+    return df.iloc[:-1]
 
 def to_heikin_ashi(df):
     ha=df.copy()
@@ -162,7 +220,7 @@ with st.sidebar:
 # ── Load data ─────────────────────────────────────────────────────────────────
 # Convert to IST for display (UTC+5:30)
 now_ist = datetime.now(timezone.utc) + pd.Timedelta(hours=5, minutes=30)
-st.caption(f"📊 Timeframe: **{selected_tf}** · ETHUSDT · Binance · Cached 2 min · {now_ist.strftime('%Y-%m-%d %H:%M IST')}")
+st.caption(f"📊 Timeframe: **{selected_tf}** · ETHUSD · Delta India (exact TradingView data) · Cached 2 min · {now_ist.strftime('%Y-%m-%d %H:%M IST')}")
 
 with st.spinner(f"Fetching {selected_tf} candles..."):
     df = fetch_candles(selected_tf, 550)
@@ -300,13 +358,13 @@ fig.update_layout(
     paper_bgcolor="#131722", plot_bgcolor="#131722",
     xaxis=dict(gridcolor="#2a2e39"),
     yaxis=dict(gridcolor="#2a2e39"),
-    title=dict(text=f"ETHUSDT · {selected_tf} · SuperTrend({st_period},{st_mult}) · NW Envelope(BW={nw_bw}, Mult={nw_mult})",
+    title=dict(text=f"ETHUSD.P · {selected_tf} · SuperTrend({st_period},{st_mult}) · NW(BW={nw_bw}, Mult={nw_mult}) · Delta India",
                font=dict(size=12, color="#787b86"), x=0))
 st.plotly_chart(fig, use_container_width=True)
 
 # ── Table ─────────────────────────────────────────────────────────────────────
 st.subheader("🔢 Last 15 Bars")
-st.caption(f"LuxAlgo match settings → src=close, Window=500, Bandwidth={nw_bw}, Mult={nw_mult}, Repaint=ON")
+st.caption(f"LuxAlgo settings to match → src=close, Window=500, BW={nw_bw}, Mult={nw_mult}, Repaint=ON · Using Delta India data so values should match exactly")
 t = df_display.tail(15).copy()
 t["NW Upper"] = nw_upper.tail(15).values
 t["NW Lower"] = nw_lower.tail(15).values
