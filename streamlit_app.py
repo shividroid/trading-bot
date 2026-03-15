@@ -6,7 +6,7 @@ import plotly.graph_objects as go
 from datetime import datetime, timezone
 
 st.set_page_config(page_title="ETH Trading Bot", page_icon="📈", layout="wide")
-BANDWIDTH=8; ATR_PERIOD=21; ST_FACTOR=0.75; NW_MULT=3.0
+BANDWIDTH=8; ATR_PERIOD=21; ST_FACTOR=0.75
 
 @st.cache_data(ttl=300)
 def fetch_candles(limit=550):
@@ -50,39 +50,78 @@ def compute_supertrend(df,period=21,mult=0.75):
     return st_,trend
 
 @st.cache_data(ttl=300)
-def compute_nw(ha_close_tuple,bw=8,smooth=True,atr_tuple=None):
-    prices=np.array(ha_close_tuple,dtype=float); n=len(prices)
-    mid=np.full(n,np.nan); ws=max(0,n-500)
-    for bar in range(ws,n):
-        w=np.array([math.exp(-0.5*((bar-j)/bw)**2) for j in range(ws,n)])
-        mid[bar]=np.dot(w,prices[ws:n])/w.sum()
-    s=pd.Series(mid)
-    if smooth: s=s.ewm(span=2,adjust=False).mean()
-    atr=np.array(atr_tuple,dtype=float) if atr_tuple else np.full(n,np.nan)
-    return (s+atr*NW_MULT).values,(s-atr*NW_MULT).values,s.values
+def compute_nw(close_tuple, bw=8, mult=3.0, window=500):
+    """
+    Exact LuxAlgo NW Envelope implementation.
+    Pine Script source:
+      - src = close  (regular close, NOT HA)
+      - window = 500 bars
+      - y2[i] = kernel weighted avg over window
+      - y1[i] = (y2[i] + y2[i-1]) / 2  (smooth = average of current and prev)
+      - MAE = mult * mean(abs(src - y1))  over window
+      - upper = y1 + MAE
+      - lower = y1 - MAE
+    """
+    src    = np.array(close_tuple, dtype=float)
+    n      = len(src)
+    ws     = max(0, n - window)  # window start
+
+    # Step 1: compute raw kernel estimate y2 for each bar in window
+    y2 = np.full(n, np.nan)
+    for i in range(ws, n):
+        # distance from bar i going backwards into window
+        # Pine: weight = exp(-0.5 * ((i - j) / h)^2)
+        weights = np.array([
+            math.exp(-0.5 * ((i - j) / bw) ** 2)
+            for j in range(ws, n)
+        ])
+        y2[i] = np.dot(weights, src[ws:n]) / weights.sum()
+
+    # Step 2: y1 = smooth of y2
+    # Pine: y1[i] = (y2[i] + y2[i-1]) / 2
+    y1 = np.full(n, np.nan)
+    for i in range(ws + 1, n):
+        y1[i] = (y2[i] + y2[i - 1]) / 2
+    y1[ws] = y2[ws]  # first bar
+
+    # Step 3: MAE = mult * mean(|src - y1|) over window
+    valid = ~np.isnan(y1[ws:])
+    mae   = mult * np.mean(np.abs(src[ws:][valid] - y1[ws:][valid]))
+
+    upper = y1 + mae
+    lower = y1 - mae
+
+    return (pd.Series(upper, dtype=float),
+            pd.Series(lower, dtype=float),
+            pd.Series(y1,    dtype=float),
+            pd.Series(y2,    dtype=float))
 
 def compute_bb_expansion(close):
     bw=(4*2.0*close.rolling(20).std(ddof=0))/close.rolling(20).mean()*100.0
     return bw>bw.rolling(50).mean()*1.1
 
+# ── UI ──────────────────────────────────────────────────────────────────────
 st.title("📈 ETH SuperTrend Bot — Live Dashboard")
 st.caption(f"Data cached 5 min · {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
 
 with st.sidebar:
     st.header("⚙️ Settings")
-    bars_to_show=st.slider("Bars to show",50,300,100)
-    show_ha=st.toggle("Heikin Ashi candles",value=False)
-    show_st=st.toggle("SuperTrend line",value=True)
-    show_nw=st.toggle("NW Envelope",value=True)
+    bars_to_show  = st.slider("Bars to show", 50, 300, 100)
+    nw_mult       = st.slider("NW Multiplier (Mult)", 1.0, 5.0, 3.0, 0.5)
+    nw_bw         = st.slider("NW Bandwidth", 2, 20, 8)
+    show_ha       = st.toggle("Heikin Ashi candles", value=False)
+    show_st       = st.toggle("SuperTrend line",     value=True)
+    show_nw       = st.toggle("NW Envelope",         value=True)
+    show_triangles= st.toggle("NW Cross Triangles",  value=True)
     st.divider()
     st.subheader("🔬 LuxAlgo Comparison")
     st.caption("Paste latest bar values from TradingView")
-    lux_u=st.number_input("LuxAlgo NW Upper",value=0.0,format="%.2f")
-    lux_l=st.number_input("LuxAlgo NW Lower",value=0.0,format="%.2f")
+    lux_u = st.number_input("LuxAlgo NW Upper", value=0.0, format="%.2f")
+    lux_l = st.number_input("LuxAlgo NW Lower", value=0.0, format="%.2f")
     st.divider()
     st.subheader("🔔 Test Telegram")
-    tg_token=st.text_input("Bot Token",type="password",placeholder="123:AAF...")
-    tg_chat=st.text_input("Chat ID",value="1130112754")
+    tg_token = st.text_input("Bot Token", type="password", placeholder="123:AAF...")
+    tg_chat  = st.text_input("Chat ID", value="1130112754")
     if st.button("📤 Send Test"):
         if tg_token:
             try:
@@ -94,83 +133,138 @@ with st.sidebar:
         else: st.warning("Enter token first")
     if st.button("🔄 Refresh"): st.cache_data.clear(); st.rerun()
 
+# ── Load data ────────────────────────────────────────────────────────────────
 with st.spinner("Fetching candles..."):
-    df=fetch_candles(550)
+    df = fetch_candles(550)
 if df is None:
     st.error("❌ Could not fetch data"); st.stop()
 
-ha=to_heikin_ashi(df)
-hi,lo,cl=df["high"],df["low"],df["close"]
-tr=pd.concat([hi-lo,(hi-cl.shift(1)).abs(),(lo-cl.shift(1)).abs()],axis=1).max(axis=1)
-atr=tr.ewm(span=ATR_PERIOD,adjust=False).mean()
-st_line,st_dir=compute_supertrend(df,ATR_PERIOD,ST_FACTOR)
-bb_exp=compute_bb_expansion(cl)
-nwu_a,nwl_a,nwm_a=compute_nw(tuple(ha["close"].tolist()),BANDWIDTH,True,tuple(atr.tolist()))
-nw_upper=pd.Series(nwu_a,index=df.index)
-nw_lower=pd.Series(nwl_a,index=df.index)
-nw_mid  =pd.Series(nwm_a,index=df.index)
+ha = to_heikin_ashi(df)
+hi, lo, cl = df["high"], df["low"], df["close"]
+tr  = pd.concat([hi-lo,(hi-cl.shift(1)).abs(),(lo-cl.shift(1)).abs()],axis=1).max(axis=1)
+atr = tr.ewm(span=ATR_PERIOD, adjust=False).mean()
+st_line, st_dir = compute_supertrend(df, ATR_PERIOD, ST_FACTOR)
+bb_exp = compute_bb_expansion(cl)
 
-cc=df["close"].iloc[-1]; prev=df["close"].iloc[-2]
-chg=cc-prev; chgp=chg/prev*100
-cur_nwu=nw_upper.iloc[-1]; cur_nwl=nw_lower.iloc[-1]
-is_bull=st_dir.iloc[-1]==-1; flipped=st_dir.iloc[-1]!=st_dir.iloc[-2]
+# NW uses regular close (same as LuxAlgo default src=close)
+nw_upper_s, nw_lower_s, nw_mid_s, nw_y2_s = compute_nw(
+    tuple(df["close"].tolist()), bw=nw_bw, mult=nw_mult)
+
+nw_upper = pd.Series(nw_upper_s.values, index=df.index)
+nw_lower = pd.Series(nw_lower_s.values, index=df.index)
+nw_mid   = pd.Series(nw_mid_s.values,   index=df.index)
+
+# ── Triangle signals: close crosses upper/lower ───────────────────────────
+close_s   = df["close"]
+cross_up  = (close_s > nw_upper) & (close_s.shift(1) <= nw_upper.shift(1))  # close crosses ABOVE upper → sell triangle
+cross_dn  = (close_s < nw_lower) & (close_s.shift(1) >= nw_lower.shift(1))  # close crosses BELOW lower → buy triangle
+
+# ── Metrics ──────────────────────────────────────────────────────────────────
+cc      = df["close"].iloc[-1]; prev=df["close"].iloc[-2]
+chg     = cc-prev; chgp=chg/prev*100
+cur_nwu = nw_upper.iloc[-1]; cur_nwl=nw_lower.iloc[-1]
+is_bull = st_dir.iloc[-1]==-1; flipped=st_dir.iloc[-1]!=st_dir.iloc[-2]
 
 c1,c2,c3,c4,c5=st.columns(5)
-c1.metric("ETH Price",  f"${cc:,.2f}", f"{chg:+.2f} ({chgp:+.2f}%)")
+c1.metric("ETH Price",   f"${cc:,.2f}", f"{chg:+.2f} ({chgp:+.2f}%)")
 c2.metric("ST Direction","🟢 BULL" if is_bull else "🔴 BEAR")
-c3.metric("NW Upper",   f"${cur_nwu:,.2f}")
-c4.metric("NW Lower",   f"${cur_nwl:,.2f}")
-c5.metric("ATR",        f"${atr.iloc[-1]:.2f}")
+c3.metric("NW Upper",    f"${cur_nwu:,.2f}")
+c4.metric("NW Lower",    f"${cur_nwl:,.2f}")
+c5.metric("ATR",         f"${atr.iloc[-1]:.2f}")
 
-if lux_u>0 and lux_l>0:
+if lux_u > 0 and lux_l > 0:
     du=abs(lux_u-cur_nwu); dl=abs(lux_l-cur_nwl)
-    if du<15 and dl<15: st.success(f"✅ Good match — Upper diff: ${du:.2f} | Lower diff: ${dl:.2f}")
-    else: st.warning(f"⚠️ Large diff — Upper: ${du:.2f} | Lower: ${dl:.2f} · Check LuxAlgo: BW=8, Smooth=ON, Repaint=ON, Mult=3.0")
+    if du<15 and dl<15:
+        st.success(f"✅ Good match — Upper diff: ${du:.2f} | Lower diff: ${dl:.2f}")
+    else:
+        st.warning(f"⚠️ Upper diff: ${du:.2f} | Lower diff: ${dl:.2f} — if still off, check LuxAlgo: src=close, BW=8, Mult=3, Window=500, Repaint=ON")
 
+# ── Chart ────────────────────────────────────────────────────────────────────
+sl  = bars_to_show
+src = ha.iloc[-sl:] if show_ha else df.iloc[-sl:]
+fig = go.Figure()
 
-sl=bars_to_show
-src=ha.iloc[-sl:] if show_ha else df.iloc[-sl:]
-fig=go.Figure()
-fig.add_trace(go.Candlestick(x=src.index,open=src["open"],high=src["high"],
-    low=src["low"],close=src["close"],
-    increasing_line_color="#26a69a",decreasing_line_color="#ef5350",
-    name="HA" if show_ha else "ETH",line_width=1))
+# Candlesticks
+fig.add_trace(go.Candlestick(
+    x=src.index, open=src["open"], high=src["high"],
+    low=src["low"], close=src["close"],
+    increasing_line_color="#26a69a", decreasing_line_color="#ef5350",
+    name="HA" if show_ha else "ETH", line_width=1))
+
+# NW Envelope
 if show_nw:
-    fig.add_trace(go.Scatter(x=nw_upper.iloc[-sl:].index,y=nw_upper.iloc[-sl:].values,
-        line=dict(color="rgba(38,166,154,0.9)",width=1.5,dash="dot"),name="NW Upper"))
-    fig.add_trace(go.Scatter(x=nw_lower.iloc[-sl:].index,y=nw_lower.iloc[-sl:].values,
-        line=dict(color="rgba(239,83,80,0.9)",width=1.5,dash="dot"),
-        fill="tonexty",fillcolor="rgba(100,100,100,0.07)",name="NW Lower"))
-    fig.add_trace(go.Scatter(x=nw_mid.iloc[-sl:].index,y=nw_mid.iloc[-sl:].values,
-        line=dict(color="rgba(41,98,255,0.6)",width=1),name="NW Mid"))
+    fig.add_trace(go.Scatter(
+        x=nw_upper.iloc[-sl:].index, y=nw_upper.iloc[-sl:].values,
+        line=dict(color="rgba(38,166,154,0.9)", width=2),
+        name="NW Upper"))
+    fig.add_trace(go.Scatter(
+        x=nw_lower.iloc[-sl:].index, y=nw_lower.iloc[-sl:].values,
+        line=dict(color="rgba(239,83,80,0.9)", width=2),
+        fill="tonexty", fillcolor="rgba(100,100,100,0.06)",
+        name="NW Lower"))
+    fig.add_trace(go.Scatter(
+        x=nw_mid.iloc[-sl:].index, y=nw_mid.iloc[-sl:].values,
+        line=dict(color="rgba(41,98,255,0.5)", width=1, dash="dot"),
+        name="NW Mid (y1)"))
+
+# Triangles — cross above upper = bearish (sell) = red triangle down
+# cross below lower = bullish (buy) = green triangle up
+if show_triangles:
+    cu = cross_up.iloc[-sl:]
+    cd = cross_dn.iloc[-sl:]
+    if cu.any():
+        fig.add_trace(go.Scatter(
+            x=nw_upper.iloc[-sl:][cu].index,
+            y=nw_upper.iloc[-sl:][cu].values + (cur_nwu - cur_nwl) * 0.02,
+            mode="markers",
+            marker=dict(symbol="triangle-down", color="#ef5350", size=12),
+            name="Cross Upper ▼"))
+    if cd.any():
+        fig.add_trace(go.Scatter(
+            x=nw_lower.iloc[-sl:][cd].index,
+            y=nw_lower.iloc[-sl:][cd].values - (cur_nwu - cur_nwl) * 0.02,
+            mode="markers",
+            marker=dict(symbol="triangle-up", color="#26a69a", size=12),
+            name="Cross Lower ▲"))
+
+# SuperTrend
 if show_st:
     stv=st_line.iloc[-sl:]; sdv=st_dir.iloc[-sl:]
-    fig.add_trace(go.Scatter(x=stv[sdv==-1].index,y=stv[sdv==-1].values,
-        mode="markers",marker=dict(color="#26a69a",size=3),name="ST Bull"))
-    fig.add_trace(go.Scatter(x=stv[sdv==1].index,y=stv[sdv==1].values,
-        mode="markers",marker=dict(color="#ef5350",size=3),name="ST Bear"))
-fig.update_layout(height=520,template="plotly_dark",xaxis_rangeslider_visible=False,
-    legend=dict(orientation="h",y=1.02),margin=dict(l=0,r=0,t=30,b=0),
-    paper_bgcolor="#131722",plot_bgcolor="#131722",
-    xaxis=dict(gridcolor="#2a2e39"),yaxis=dict(gridcolor="#2a2e39"))
-st.plotly_chart(fig,use_container_width=True)
+    fig.add_trace(go.Scatter(
+        x=stv[sdv==-1].index, y=stv[sdv==-1].values,
+        mode="markers", marker=dict(color="#26a69a", size=3), name="ST Bull"))
+    fig.add_trace(go.Scatter(
+        x=stv[sdv==1].index, y=stv[sdv==1].values,
+        mode="markers", marker=dict(color="#ef5350", size=3), name="ST Bear"))
 
-st.subheader("📊 Current Bar")
+fig.update_layout(
+    height=560, template="plotly_dark", xaxis_rangeslider_visible=False,
+    legend=dict(orientation="h", y=1.02), margin=dict(l=0,r=0,t=30,b=0),
+    paper_bgcolor="#131722", plot_bgcolor="#131722",
+    xaxis=dict(gridcolor="#2a2e39"), yaxis=dict(gridcolor="#2a2e39"))
+st.plotly_chart(fig, use_container_width=True)
+
+# ── Status ────────────────────────────────────────────────────────────────────
+st.subheader("📊 Current Bar Status")
 c1,c2,c3,c4=st.columns(4)
 c1.metric("ST Flipped",  "YES ⚡" if flipped else "No")
 c2.metric("BB Expansion","✅ YES" if bb_exp.iloc[-1] else "❌ No")
-c3.metric("NW Long OK",  "✅" if cc<=cur_nwu else "⚠️ Overextended")
-c4.metric("NW Short OK", "✅" if cc>=cur_nwl else "⚠️ Overextended")
+c3.metric("NW Long OK",  "✅" if cc<=cur_nwu else "⚠️ Above Upper")
+c4.metric("NW Short OK", "✅" if cc>=cur_nwl else "⚠️ Below Lower")
 
+# ── Table ────────────────────────────────────────────────────────────────────
 st.subheader("🔢 Last 15 Bars — Compare with LuxAlgo")
-t=df.tail(15).copy()
-t["HA Close"]=ha["close"].tail(15).round(2)
-t["NW Upper"]=nw_upper.tail(15).round(2)
-t["NW Lower"]=nw_lower.tail(15).round(2)
-t["NW Mid"]  =nw_mid.tail(15).round(2)
-t["ST"]      =st_dir.tail(15).map({-1:"🟢 BULL",1:"🔴 BEAR",0:"-"})
-t.index      =t.index.strftime("%m-%d %H:%M")
-st.dataframe(t[["close","HA Close","NW Upper","NW Lower","NW Mid","ST"]].rename(columns={"close":"Close"}),use_container_width=True)
+st.caption("LuxAlgo settings to match: src=close, Window=500, Bandwidth=8, Mult=3.0, Repaint=ON")
+t = df.tail(15).copy()
+t["NW Upper"] = nw_upper.tail(15).round(2)
+t["NW Lower"] = nw_lower.tail(15).round(2)
+t["NW Mid"]   = nw_mid.tail(15).round(2)
+t["ST"]       = st_dir.tail(15).map({-1:"🟢 BULL", 1:"🔴 BEAR", 0:"-"})
+t["Cross"]    = ""
+t.loc[cross_up.tail(15)[cross_up.tail(15)].index, "Cross"] = "▼ Sell"
+t.loc[cross_dn.tail(15)[cross_dn.tail(15)].index, "Cross"] = "▲ Buy"
+t.index = t.index.strftime("%m-%d %H:%M")
+st.dataframe(
+    t[["close","NW Upper","NW Lower","NW Mid","ST","Cross"]].rename(columns={"close":"Close"}),
+    use_container_width=True)
 st.caption("⚠️ Telegram token is never stored — only used for the live test above.")
-
-
