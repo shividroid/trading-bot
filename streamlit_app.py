@@ -139,32 +139,44 @@ def compute_supertrend(df, period=21, mult=0.75):
 @st.cache_data(ttl=120)
 def compute_nw(close_tuple, bw=8, mult=3.0, window=500):
     """
-    Exact LuxAlgo NW Envelope:
-    - src = close
-    - y2[i] = kernel weighted avg (Gaussian) over window
-    - y1[i] = (y2[i] + y2[i-1]) / 2  (smooth)
-    - band  = mult * MAD(src, y1) over window
+    Exact LuxAlgo NW Envelope Pine Script implementation:
+
+    Pine code (open source):
+      y2[i] = kernel_weighted_avg(src, i)     // raw kernel output
+      y1[i] = (y2[i] + y2[i-1]) / 2          // smoothed line
+      sum_e += abs(src[i] - y2[i])            // MAE uses y2 NOT y1
+      mae    = mult * sum_e / length
+      upper  = y1 + mae
+      lower  = y1 - mae
+
+    Critical: band width = mean(|close - y2|) * mult
+    NOT mean(|close - y1|) — that's why our bands were narrower than LuxAlgo.
     """
     src = np.array(close_tuple, dtype=float)
     n   = len(src)
     ws  = max(0, n - window)
 
+    # Step 1: raw kernel estimate y2
     y2 = np.full(n, np.nan)
     for i in range(ws, n):
         w     = np.array([math.exp(-0.5*((i-j)/bw)**2) for j in range(ws, n)])
         y2[i] = np.dot(w, src[ws:n]) / w.sum()
 
+    # Step 2: smoothed line y1 = avg of current and prev y2
     y1 = np.full(n, np.nan)
     y1[ws] = y2[ws]
     for i in range(ws+1, n):
         y1[i] = (y2[i] + y2[i-1]) / 2
 
-    valid = ~np.isnan(y1[ws:])
-    mae   = mult * np.mean(np.abs(src[ws:][valid] - y1[ws:][valid]))
+    # Step 3: MAE = mean(|src - y2|) * mult  <-- uses y2 not y1
+    window_src = src[ws:]
+    window_y2  = y2[ws:]
+    valid      = ~np.isnan(window_y2)
+    mae        = mult * np.mean(np.abs(window_src[valid] - window_y2[valid]))
 
-    return (pd.Series(y1+mae, dtype=float),
-            pd.Series(y1-mae, dtype=float),
-            pd.Series(y1,     dtype=float))
+    return (pd.Series(y1 + mae, dtype=float),
+            pd.Series(y1 - mae, dtype=float),
+            pd.Series(y1,       dtype=float))
 
 def compute_bb_expansion(close):
     bw=(4*2.0*close.rolling(20).std(ddof=0))/close.rolling(20).mean()*100.0
