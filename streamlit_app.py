@@ -230,31 +230,44 @@ if df is None:
 
 ha = to_heikin_ashi(df)
 
-# Convert timestamps to IST for display (UTC+5:30)
-ist_offset = pd.Timedelta(hours=5, minutes=30)
+# Convert timestamps to IST + shift by candle duration to match TradingView
+# TradingView labels candles by CLOSE time; APIs return OPEN time
+# e.g. 09:00 UTC open = 14:30 IST open = 15:30 IST close (TradingView shows 15:30)
+TF_DURATION = {
+    "1m": pd.Timedelta(minutes=1),   "3m": pd.Timedelta(minutes=3),
+    "5m": pd.Timedelta(minutes=5),   "15m": pd.Timedelta(minutes=15),
+    "30m": pd.Timedelta(minutes=30), "45m": pd.Timedelta(minutes=45),
+    "1h": pd.Timedelta(hours=1),     "2h": pd.Timedelta(hours=2),
+    "4h": pd.Timedelta(hours=4),     "6h": pd.Timedelta(hours=6),
+    "1D": pd.Timedelta(days=1),      "1W": pd.Timedelta(weeks=1),
+}
+ist_offset   = pd.Timedelta(hours=5, minutes=30)
+candle_dur   = TF_DURATION.get(selected_tf, pd.Timedelta(hours=1))
+display_shift = ist_offset + candle_dur   # IST + candle duration = close time in IST
+
 df_display = df.copy()
-df_display.index = df_display.index + ist_offset
+df_display.index = df_display.index + display_shift
 ha_display = ha.copy()
-ha_display.index = ha_display.index + ist_offset
+ha_display.index = ha_display.index + display_shift
 hi, lo, cl = df["high"], df["low"], df["close"]
 tr  = pd.concat([hi-lo,(hi-cl.shift(1)).abs(),(lo-cl.shift(1)).abs()],axis=1).max(axis=1)
 atr = tr.ewm(span=st_period, adjust=False).mean()
 
 st_line, st_dir = compute_supertrend(df, st_period, st_mult)
-st_line.index = df.index + ist_offset
-st_dir.index  = df.index + ist_offset
+st_line.index = df.index + display_shift
+st_dir.index  = df.index + display_shift
 bb_exp = compute_bb_expansion(cl)
-bb_exp.index  = df.index + ist_offset
+bb_exp.index  = df.index + display_shift
 
 nw_upper_s, nw_lower_s, nw_mid_s = compute_nw(
     tuple(df["close"].tolist()), bw=nw_bw, mult=nw_mult)
 
-nw_upper = pd.Series(nw_upper_s.values, index=df.index + ist_offset)
-nw_lower = pd.Series(nw_lower_s.values, index=df.index + ist_offset)
-nw_mid   = pd.Series(nw_mid_s.values,   index=df.index + ist_offset)
+nw_upper = pd.Series(nw_upper_s.values, index=df.index + display_shift)
+nw_lower = pd.Series(nw_lower_s.values, index=df.index + display_shift)
+nw_mid   = pd.Series(nw_mid_s.values,   index=df.index + display_shift)
 
 # Triangles — use IST-indexed close
-close_s  = pd.Series(df["close"].values, index=df.index + ist_offset)
+close_s  = pd.Series(df["close"].values, index=df.index + display_shift)
 cross_up = (close_s > nw_upper) & (close_s.shift(1) <= nw_upper.shift(1))
 cross_dn = (close_s < nw_lower) & (close_s.shift(1) >= nw_lower.shift(1))
 
@@ -379,7 +392,7 @@ t["Signal"]   = ""
 cup = cross_up.tail(15); cdn = cross_dn.tail(15)
 t.loc[cup[cup].index, "Signal"] = "▼ Sell"
 t.loc[cdn[cdn].index, "Signal"] = "▲ Buy"
-t.index = (t.index + ist_offset).strftime("%m-%d %H:%M IST")
+t.index = (t.index + display_shift).strftime("%m-%d %H:%M IST")
 st.dataframe(
     t[["close","NW Upper","NW Lower","NW Mid","ST Line","ST","Signal"]].rename(columns={"close":"Close"}),
     use_container_width=True)
